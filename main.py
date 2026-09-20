@@ -39,7 +39,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "repcl_bot.db")
 def load_config() -> dict:
     default_config = {
         "guild_id": 0,
-        "roblox_group_id": 12345678,
+        "roblox_group_id": 4683210,
         "audit_channel_id": 0,
         "verification_channel_id": 0,
         "citizen_role_id": 0,
