@@ -39,7 +39,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "repcl_bot.db")
 def load_config() -> dict:
     default_config = {
         "guild_id": 0,
-        "roblox_group_id": 13698921,
+        "roblox_group_id": 12345678,
         "audit_channel_id": 0,
         "verification_channel_id": 0,
         "citizen_role_id": 0,
@@ -76,6 +76,12 @@ def load_config() -> dict:
                 default_config.update(data)
         except Exception as e:
             print(f"[!] Error leyendo config.json: {e}. Usando configuración por defecto.")
+            
+    # Permitir configurar ROBLOX_GROUP_ID desde variables de entorno (.env o Render)
+    env_group_id = os.getenv("ROBLOX_GROUP_ID")
+    if env_group_id and env_group_id.strip().isdigit():
+        default_config["roblox_group_id"] = int(env_group_id.strip())
+
     return default_config
 
 config = load_config()
@@ -364,13 +370,66 @@ async def send_audit_log(guild: discord.Guild, embed: discord.Embed):
 # ---------------------------------------------------------------------------
 # 5. SISTEMA DE VERIFICACIÓN ROBLOX ↔ DISCORD
 # ---------------------------------------------------------------------------
+def normalize_role_name(s: str) -> str:
+    import unicodedata, re
+    if not s:
+        return ""
+    s = unicodedata.normalize('NFKD', str(s)).encode('ASCII', 'ignore').decode('utf-8').lower()
+    s = re.sub(r'\[.*?\]|\(.*?\)', '', s)
+    s = re.sub(r'[^a-z0-9\s]', '', s)
+    return " ".join(s.split())
+
+def find_military_role(guild: discord.Guild, roblox_role_name: str, rank_num: int, rank_mappings: list) -> Optional[discord.Role]:
+    # 1. Intentar por ID configurado
+    for m in rank_mappings:
+        if m.get("roblox_rank_id") == rank_num:
+            rid = m.get("discord_role_id", 0)
+            if rid and rid > 0:
+                r = guild.get_role(rid)
+                if r:
+                    return r
+            break
+
+    norm_target = normalize_role_name(roblox_role_name)
+    if not norm_target:
+        return None
+
+    # 2. Coincidencia exacta de nombre normalizado
+    for r in guild.roles:
+        if r.is_default():
+            continue
+        if normalize_role_name(r.name) == norm_target:
+            return r
+
+    # 3. Coincidencia por subcadena
+    for r in guild.roles:
+        if r.is_default():
+            continue
+        norm_r = normalize_role_name(r.name)
+        if norm_r and (norm_target in norm_r or norm_r in norm_target):
+            return r
+
+    return None
+
+def find_citizen_role(guild: discord.Guild, configured_id: int) -> Optional[discord.Role]:
+    if configured_id and configured_id > 0:
+        r = guild.get_role(configured_id)
+        if r:
+            return r
+    for r in guild.roles:
+        if r.is_default():
+            continue
+        norm_r = normalize_role_name(r.name)
+        if "ciudadano" in norm_r or "civil" in norm_r:
+            return r
+    return None
+
 async def apply_roles_for_user(member: discord.Member, roblox_info: dict, group_role: dict):
-    """Asigna o revoca los roles correspondientes de Discord basándose en el rango de Roblox"""
+    """Asigna o revoca los roles correspondientes de Discord basándose en el rango de Roblox de forma inteligente"""
     guild = member.guild
-    citizen_role_id = config.get("citizen_role_id")
+    citizen_role_id = config.get("citizen_role_id", 0)
     rank_mappings = config.get("rank_mappings", [])
 
-    # Obtener todos los IDs de roles militares configurados
     military_role_ids = {m["discord_role_id"] for m in rank_mappings if m.get("discord_role_id")}
     
     roles_to_remove = []
@@ -397,66 +456,69 @@ async def apply_roles_for_user(member: discord.Member, roblox_info: dict, group_
         return "blacklist", "Blacklist REPCL"
 
     if not group_role.get("in_group"):
-        # NO Pertenece al grupo -> Asignar Rol "🇨🇱 Ciudadano Chileno"
-        if citizen_role_id:
-            cit_role = guild.get_role(citizen_role_id)
-            if cit_role and cit_role not in member.roles:
-                roles_to_add.append(cit_role)
+        # NO Pertenece al grupo -> Asignar Rol de Ciudadano Chileno
+        target_cit = find_citizen_role(guild, citizen_role_id)
+        if target_cit and target_cit not in member.roles:
+            roles_to_add.append(target_cit)
         
         # Quitar roles militares si los tenía
         for r in member.roles:
             if r.id in military_role_ids:
                 roles_to_remove.append(r)
         
-        if roles_to_remove:
-            await member.remove_roles(*roles_to_remove, reason="No pertenece al grupo Ejército de Chile")
-        if roles_to_add:
-            await member.add_roles(*roles_to_add, reason="Verificado: Ciudadano Chileno")
-        
-        # Opcional: Actualizar apodo a su nombre de Roblox
         try:
-            await member.edit(nick=f"[CIV] {roblox_info['name']}")
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason="No pertenece al grupo Ejército de Chile")
+            if roles_to_add:
+                await member.add_roles(*roles_to_add, reason="Verificado: Ciudadano Chileno")
+        except discord.Forbidden:
+            print(f"[!] Permisos insuficientes en Discord para asignar rol ciudadano a {member.display_name}")
+        except Exception as e:
+            print(f"[!] Error actualizando roles ciudadano: {e}")
+        
+        # Actualizar apodo a su nombre de Roblox (excepto al dueño del servidor de Discord)
+        try:
+            if member.id != guild.owner_id:
+                await member.edit(nick=f"[CIV] {roblox_info['name']}")
         except Exception:
             pass
 
-        return "citizen", "🇨🇱 Ciudadano Chileno"
+        return "citizen", target_cit.name if target_cit else "🇨🇱 Ciudadano Chileno"
 
     else:
         # SÍ Pertenece al grupo -> Detectar su rango de Roblox y asignar rol militar
         user_rank_num = group_role.get("rank", 0)
-        target_role_id = None
-        matched_name = group_role.get("role_name", "Militar")
+        raw_role_name = group_role.get("role_name", "Militar")
 
-        for mapping in rank_mappings:
-            if mapping.get("roblox_rank_id") == user_rank_num:
-                target_role_id = mapping.get("discord_role_id")
-                matched_name = mapping.get("roblox_role_name", matched_name)
-                break
+        target_role = find_military_role(guild, raw_role_name, user_rank_num, rank_mappings)
+        matched_name = target_role.name if target_role else raw_role_name
 
         # Quitar rol de ciudadano si lo tenía
-        if citizen_role_id:
-            c_role = guild.get_role(citizen_role_id)
-            if c_role and c_role in member.roles:
-                roles_to_remove.append(c_role)
+        target_cit = find_citizen_role(guild, citizen_role_id)
+        if target_cit and target_cit in member.roles:
+            roles_to_remove.append(target_cit)
 
         # Quitar roles militares viejos que no correspondan
-        for r in member.roles:
-            if r.id in military_role_ids and r.id != target_role_id:
-                roles_to_remove.append(r)
-
-        # Agregar el rol militar correspondiente
-        if target_role_id:
-            t_role = guild.get_role(target_role_id)
-            if t_role and t_role not in member.roles:
-                roles_to_add.append(t_role)
-
-        if roles_to_remove:
-            await member.remove_roles(*roles_to_remove, reason="Actualización de Rango Militar REPCL")
-        if roles_to_add:
-            await member.add_roles(*roles_to_add, reason=f"Asignación de Rango Militar: {matched_name}")
+        if target_role:
+            for r in member.roles:
+                if (r.id in military_role_ids or "militar" in normalize_role_name(r.name)) and r != target_role:
+                    roles_to_remove.append(r)
+            if target_role not in member.roles:
+                roles_to_add.append(target_role)
 
         try:
-            await member.edit(nick=f"[{matched_name}] {roblox_info['name']}")
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason="Actualización de Rango Militar REPCL")
+            if roles_to_add:
+                await member.add_roles(*roles_to_add, reason=f"Asignación de Rango Militar: {matched_name}")
+        except discord.Forbidden:
+            print(f"[!] Permisos insuficientes en Discord para {matched_name}. Asegúrate de que el rol del bot esté arriba en la lista de roles.")
+        except Exception as e:
+            print(f"[!] Error modificando roles militares: {e}")
+
+        try:
+            if member.id != guild.owner_id:
+                await member.edit(nick=f"[{matched_name}] {roblox_info['name']}")
         except Exception:
             pass
 
@@ -674,16 +736,45 @@ async def cmd_ascender(interaction: discord.Interaction, usuario: discord.Member
         await interaction.followup.send("❌ No se pudieron obtener los rangos del grupo de Roblox. Revisa el Group ID.")
         return
 
-    # Buscar el rol de destino
+    # Buscar el rol de destino de forma flexible (número, nombre exacto, normalizado o parcial)
     target_role = None
+    input_str = nuevo_rango.strip()
+    input_norm = normalize_role_name(input_str)
+
+    # 1. Por número de rango exacto (ej. 255, 1, 15)
     for r in roles_list:
-        if str(r.get("rank")) == nuevo_rango or r.get("name", "").lower() == nuevo_rango.lower():
+        if str(r.get("rank")) == input_str:
             target_role = r
             break
 
+    # 2. Por nombre exacto
     if not target_role:
-        valid_roles = ", ".join([f"`{r['name']}` ({r['rank']})" for r in roles_list if r['rank'] > 0])
-        await interaction.followup.send(f"❌ Rango **`{nuevo_rango}`** no válido.\n**Rangos disponibles:**\n{valid_roles}")
+        for r in roles_list:
+            if r.get("name", "").lower() == input_str.lower():
+                target_role = r
+                break
+
+    # 3. Por nombre normalizado (sin corchetes [GdE] ni acentos)
+    if not target_role and input_norm:
+        for r in roles_list:
+            if normalize_role_name(r.get("name", "")) == input_norm:
+                target_role = r
+                break
+
+    # 4. Por coincidencia parcial
+    if not target_role and input_norm:
+        for r in roles_list:
+            r_norm = normalize_role_name(r.get("name", ""))
+            if r_norm and (input_norm in r_norm or r_norm in input_norm):
+                target_role = r
+                break
+
+    if not target_role:
+        valid_roles = "\n".join([f"• **Nivel {r['rank']}**: `{r['name']}`" for r in roles_list if r['rank'] > 0])
+        await interaction.followup.send(
+            f"❌ Rango **`{nuevo_rango}`** no encontrado en el grupo de Roblox.\n\n"
+            f"**💡 Puedes usar el número de nivel o el nombre:**\n{valid_roles}"
+        )
         return
 
     # Obtener rango actual del usuario
@@ -744,13 +835,39 @@ async def cmd_descender(interaction: discord.Interaction, usuario: discord.Membe
     group_id = config.get("roblox_group_id", 0)
     roles_list = await roblox_client.get_group_roles(group_id)
     target_role = None
+    input_str = nuevo_rango.strip()
+    input_norm = normalize_role_name(input_str)
+
     for r in roles_list:
-        if str(r.get("rank")) == nuevo_rango or r.get("name", "").lower() == nuevo_rango.lower():
+        if str(r.get("rank")) == input_str:
             target_role = r
             break
 
     if not target_role:
-        await interaction.followup.send(f"❌ Rango `{nuevo_rango}` no encontrado en el grupo de Roblox.")
+        for r in roles_list:
+            if r.get("name", "").lower() == input_str.lower():
+                target_role = r
+                break
+
+    if not target_role and input_norm:
+        for r in roles_list:
+            if normalize_role_name(r.get("name", "")) == input_norm:
+                target_role = r
+                break
+
+    if not target_role and input_norm:
+        for r in roles_list:
+            r_norm = normalize_role_name(r.get("name", ""))
+            if r_norm and (input_norm in r_norm or r_norm in input_norm):
+                target_role = r
+                break
+
+    if not target_role:
+        valid_roles = "\n".join([f"• **Nivel {r['rank']}**: `{r['name']}`" for r in roles_list if r['rank'] > 0])
+        await interaction.followup.send(
+            f"❌ Rango **`{nuevo_rango}`** no encontrado en el grupo de Roblox.\n\n"
+            f"**💡 Rangos disponibles:**\n{valid_roles}"
+        )
         return
 
     current_role = await roblox_client.get_user_group_role(linked["roblox_id"], group_id)
@@ -823,6 +940,50 @@ async def cmd_rango(interaction: discord.Interaction, usuario: Optional[discord.
     roles = [r.mention for r in target.roles if r.name != "@everyone"]
     embed.add_field(name="🏷️ Roles en Discord", value=" ".join(roles[:8]) if roles else "Sin roles", inline=False)
     embed.add_field(name="📅 Fecha de Vinculación", value=f"`{linked['linked_at'][:10]}`", inline=True)
+
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="ver-rangos", description="Muestra todos los rangos del grupo de Roblox y cómo se vinculan en Discord")
+async def cmd_ver_rangos(interaction: discord.Interaction):
+    await interaction.response.defer()
+    if not is_repcl_admin(interaction.user):
+        await interaction.followup.send("❌ No tienes permisos para ver la tabla de rangos militar.", ephemeral=True)
+        return
+
+    group_id = config.get("roblox_group_id", 0)
+    roles_list = await roblox_client.get_group_roles(group_id)
+    if not roles_list:
+        await interaction.followup.send("❌ No se pudieron cargar los rangos del grupo de Roblox. Revisa el `ROBLOX_GROUP_ID`.")
+        return
+
+    guild = interaction.guild
+    rank_mappings = config.get("rank_mappings", [])
+    
+    embed = discord.Embed(
+        title="🇨🇱 TABLA DE RANGOS • ROBLOX ↔ DISCORD",
+        description=f"Estado de sincronización para el Grupo de Roblox ID: **`{group_id}`**\nEl bot empareja automáticamente por número o nombre de rol.",
+        color=0x3498db,
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    lines = []
+    # Ordenar por rango de mayor a menor
+    sorted_roles = sorted([r for r in roles_list if r['rank'] > 0], key=lambda x: x['rank'], reverse=True)
+    
+    for r in sorted_roles:
+        d_role = find_military_role(guild, r["name"], r["rank"], rank_mappings)
+        d_status = d_role.mention if d_role else "⚠️ *(Sin rol en Discord)*"
+        lines.append(f"• **Nivel {r['rank']}** `{r['name']}` ➔ {d_status}")
+
+    # Dividir en chunks si son muchos rangos para evitar exceder límite de Discord
+    chunk_text = "\n".join(lines[:18])
+    embed.add_field(name="🎖️ Rangos Militares Detectados", value=chunk_text or "No se encontraron rangos.", inline=False)
+    
+    cit_role = find_citizen_role(guild, config.get("citizen_role_id", 0))
+    embed.add_field(name="🇨🇱 Rol Civil / Ciudadano", value=cit_role.mention if cit_role else "⚠️ *(Sin rol en Discord)*", inline=True)
+    embed.add_field(name="💡 Uso en Comandos", value="Puedes usar `/ascender @usuario <Nivel>` (ej: `/ascender @usuario 255`)", inline=False)
+    embed.set_footer(text="REPCL • Sistema Inteligente de Roles", icon_url=config.get("server_icon_url"))
 
     await interaction.followup.send(embed=embed)
 
@@ -1092,6 +1253,64 @@ async def cmd_blacklist_info(interaction: discord.Interaction, usuario: discord.
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+@bot.tree.command(name="config-grupo", description="Consulta o cambia el ID del grupo de Roblox del Ejército de Chile")
+@app_commands.describe(id_grupo="ID numérico de tu grupo de Roblox (dejar en blanco para consultar el actual)")
+async def cmd_config_grupo(interaction: discord.Interaction, id_grupo: Optional[int] = None):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ No tienes permisos de administrador para ejecutar este comando.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if id_grupo is not None:
+        if id_grupo <= 0:
+            await interaction.followup.send("❌ El ID de grupo debe ser un número positivo mayor que 0.", ephemeral=True)
+            return
+
+        session = await roblox_client.get_session()
+        group_name = "Desconocido"
+        try:
+            async with session.get(f"https://groups.roblox.com/v1/groups/{id_grupo}") as resp:
+                if resp.status == 200:
+                    g_data = await resp.json()
+                    group_name = g_data.get("name", "Desconocido")
+        except Exception as e:
+            print(f"[!] Error comprobando grupo de Roblox: {e}")
+
+        config["roblox_group_id"] = id_grupo
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[!] Error guardando config.json: {e}")
+
+        embed = discord.Embed(
+            title="✅ GRUPO DE ROBLOX ACTUALIZADO",
+            description=f"El bot ahora está vinculado al grupo de Roblox:\n\n**Grupo:** [{group_name}](https://www.roblox.com/groups/{id_grupo})\n**ID:** `{id_grupo}`",
+            color=0x27ae60
+        )
+        embed.set_footer(text="Los miembros que se verifiquen ahora obtendrán sus rangos militares de este grupo.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        current_id = config.get("roblox_group_id", 0)
+        session = await roblox_client.get_session()
+        group_name = "Desconocido"
+        try:
+            async with session.get(f"https://groups.roblox.com/v1/groups/{current_id}") as resp:
+                if resp.status == 200:
+                    g_data = await resp.json()
+                    group_name = g_data.get("name", "Desconocido")
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="ℹ️ CONFIGURACIÓN ACTUAL DEL GRUPO DE ROBLOX",
+            description=f"**Grupo:** [{group_name}](https://www.roblox.com/groups/{current_id})\n**ID Actual:** `{current_id}`\n\n*Para cambiarlo ejecuta:* `/config-grupo id_grupo:[ID_DE_TU_GRUPO]`",
+            color=0x3498db
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
 # ---------------------------------------------------------------------------
 # 8. SISTEMA DE AUDITORÍA Y ALERTAS AUTOMÁTICAS
 # ---------------------------------------------------------------------------
@@ -1214,14 +1433,14 @@ class RenderHealthHandler(BaseHTTPRequestHandler):
         pass
 
 def start_health_server():
-    """Inicia un servidor HTTP ligero en el puerto especificado por Render (PORT) o 8080."""
+    """Inicia un servidor HTTP ligero en el puerto especificado por Render (PORT) o 10000."""
     port_env = os.getenv("PORT")
-    port = int(port_env) if port_env else 8080
+    port = int(port_env) if port_env else 10000
     try:
         server = HTTPServer(("0.0.0.0", port), RenderHealthHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        print(f"[+] Servidor HTTP de salud activo en puerto {port} (Render Port Binding Resuelto)")
+        print(f"[+] Servidor HTTP de salud activo en 0.0.0.0:{port} (Render Port Binding Resuelto)")
     except Exception as e:
         print(f"[!] Advertencia al iniciar servidor web de salud: {e}")
 
