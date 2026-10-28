@@ -1015,6 +1015,114 @@ async def cmd_sincronizar(interaction: discord.Interaction, usuario: Optional[di
     await log_admin(interaction, "Sincronización masiva iniciada")
 
 
+@slash("crear-roles", "[ADMIN] Crea en Discord los rangos del grupo de Roblox que aún no existan")
+async def cmd_crear_roles(interaction: discord.Interaction):
+    if not await admin_guard(interaction):
+        return
+
+    guild = interaction.guild
+    bot_member = guild.me if guild else None
+    if not guild or not bot_member or not bot_member.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "❌ El bot necesita el permiso **Administrar roles** en este servidor.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    group_id = await get_group_id()
+    roblox_roles = await roblox.get_group_roles(group_id, force=True)
+    if not roblox_roles:
+        await interaction.followup.send(
+            f"⚠️ No pude obtener los rangos del grupo de Roblox `{group_id}`. "
+            "Revisa el ID del grupo y vuelve a intentarlo cuando Roblox responda.",
+            ephemeral=True,
+        )
+        return
+
+    custom_mappings = await get_custom_mappings()
+    existing_names = {
+        normalize(role.name) or role.name.casefold().strip()
+        for role in guild.roles
+        if not role.is_default() and not role.managed
+    }
+    created = []
+    already_present = 0
+    errors = []
+
+    for roblox_role in sorted(roblox_roles, key=lambda item: int(item.get("rank", 0))):
+        try:
+            rank = int(roblox_role.get("rank", 0))
+        except (TypeError, ValueError):
+            continue
+        if rank <= 0:  # El nivel 0 es el rango de invitado/no perteneciente al grupo.
+            continue
+
+        role_name = str(roblox_role.get("name") or "").strip()
+        if not role_name:
+            errors.append(f"Rango {rank}: Roblox devolvió un nombre vacío.")
+            continue
+        if len(role_name) > 100:
+            errors.append(f"{role_name[:80]}…: el nombre supera el límite de Discord (100 caracteres).")
+            continue
+
+        mapped_id = custom_mappings.get(rank)
+        if mapped_id and guild.get_role(mapped_id):
+            already_present += 1
+            continue
+
+        name_key = normalize(role_name) or role_name.casefold().strip()
+        if name_key in existing_names:
+            already_present += 1
+            continue
+
+        try:
+            created_role = await guild.create_role(
+                name=role_name,
+                hoist=False,
+                mentionable=False,
+                reason=f"Crear rol desde Roblox: grupo {group_id}, rango {rank}",
+            )
+            created.append(created_role.name)
+            existing_names.add(name_key)
+        except discord.Forbidden:
+            errors.append(f"{role_name}: Discord denegó la creación; revisa el permiso Administrar roles.")
+            break
+        except discord.HTTPException as exc:
+            errors.append(f"{role_name}: error HTTP {exc.status} al crear el rol.")
+            if getattr(exc, "code", None) == 30005:  # Límite de roles del servidor.
+                break
+
+    embed = discord.Embed(
+        title="🎖️ Roles de Roblox en Discord",
+        description=(f"Grupo Roblox: `{group_id}` · se procesaron los rangos con nivel mayor que 0.\n"
+                     f"✅ Creados: **{len(created)}** · ♻️ Ya existían o tenían mapeo: **{already_present}** · "
+                     f"⚠️ Errores: **{len(errors)}**"),
+        color=GREEN if not errors else ORANGE,
+        timestamp=utcnow(),
+    )
+    if created:
+        names = "\n".join(f"• {name}" for name in created[:12])
+        if len(created) > 12:
+            names += f"\n… y {len(created) - 12} más"
+        embed.add_field(name="Roles creados", value=trunc(names, 1024), inline=False)
+    if errors:
+        details = "\n".join(f"• {message}" for message in errors[:8])
+        if len(errors) > 8:
+            details += f"\n… y {len(errors) - 8} más"
+        embed.add_field(name="Detalles", value=trunc(details, 1024), inline=False)
+
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    await log_admin(
+        interaction,
+        "Roles de Discord creados desde Roblox",
+        f"Grupo {group_id}: {len(created)} creados, {already_present} existentes o mapeados, {len(errors)} errores.",
+    )
+
 # ---------------------------------------------------------------------------
 # 10. ASCENSOS Y RANGOS
 # ---------------------------------------------------------------------------
