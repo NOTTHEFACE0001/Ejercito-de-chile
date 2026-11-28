@@ -8,7 +8,8 @@
   Variables:   DISCORD_TOKEN (o DISCORD_BOT_TOKEN), ROBLOX_COOKIE,
                ROBLOX_GROUP_ID (opcional, valor inicial), GUILD_ID (opcional),
                DATA_DIR (carpeta del volumen persistente, ej. /data),
-               SYNC_INTERVAL_MIN (opcional, por defecto 15)
+               SYNC_INTERVAL_MIN (opcional, por defecto 15),
+               ANTHROPIC_API_KEY (chat con IA), AI_MODEL (opcional)
   Intents privilegiados a activar en el portal de Discord:
                SERVER MEMBERS INTENT + MESSAGE CONTENT INTENT
 =============================================================================
@@ -49,6 +50,8 @@ DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "repcl_bot.db")
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "15") or 15)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "claude-haiku-5-5")
 
 _env_gid = (os.getenv("ROBLOX_GROUP_ID") or "").strip()
 DEFAULT_GROUP_ID = int(_env_gid) if _env_gid.isdigit() else 13698921
@@ -208,6 +211,27 @@ CREATE TABLE IF NOT EXISTS tickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id INTEGER, user_id INTEGER, user_tag TEXT,
     status TEXT DEFAULT 'open', created_at TEXT, closed_at TEXT, closed_by TEXT
+);
+CREATE TABLE IF NOT EXISTS catalog_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    item_type TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    image_url TEXT,
+    image_blob BLOB,
+    image_ext TEXT DEFAULT 'png',
+    sort_order INTEGER DEFAULT 0,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_kind ON catalog_items(kind);
+CREATE TABLE IF NOT EXISTS shifts (
+    user_id INTEGER PRIMARY KEY,
+    guild_id INTEGER,
+    state TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    segment_start TEXT NOT NULL,
+    accumulated INTEGER DEFAULT 0
 );
 """
 
@@ -460,6 +484,9 @@ class RepclBot(commands.Bot):
         self.add_view(ConfirmIdentityView())
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
+        self.add_view(JornadaView())
+        self.add_view(make_catalog_view("unit", [], 0, force_enabled=True))
+        self.add_view(make_catalog_view("equip", [], 0, force_enabled=True))
         auto_sync_loop.start()
         expiry_loop.start()
         try:
@@ -1372,6 +1399,8 @@ async def cmd_ver_config(interaction: discord.Interaction):
     embed.add_field(name="Rol Blacklist", value=role(await get_int("blacklist_role_id")), inline=True)
     embed.add_field(name="Rol Suspensión", value=role(await get_int("suspension_role_id")), inline=True)
     embed.add_field(name="Roles admin del bot", value=" ".join(f"<@&{i}>" for i in admins) or "Solo Administradores de Discord", inline=False)
+    embed.add_field(name="Canal IA", value=chan(await get_int("ai_channel_id")), inline=True)
+    embed.add_field(name="IA (ANTHROPIC_API_KEY)", value="✅ configurada" if ANTHROPIC_API_KEY else "⚠️ falta ANTHROPIC_API_KEY", inline=True)
     me = g.me
     embed.add_field(name="Permisos del bot", value=("✅ Gestionar roles, apodos y miembros" if me.guild_permissions.manage_roles and me.guild_permissions.manage_nicknames and me.guild_permissions.moderate_members
                                                     else "⚠️ Faltan permisos (Gestionar roles / apodos / moderar miembros)"), inline=False)
@@ -1659,6 +1688,10 @@ async def on_message(message: discord.Message):
                     fields=[("Palabras detectadas", ", ".join(sorted(set(x.lower() for x in m))), True),
                             ("Sugerencia", "Revisar contexto y usar `/sancionar` o `/ban` si corresponde.", False),
                             ("Mensaje", f"[Ir al mensaje]({message.jump_url})", True)])
+    try:
+        await handle_ai_message(message)
+    except Exception as e:
+        print(f"[!] IA: {e}")
     await bot.process_commands(message)
 
 @bot.event
@@ -1810,83 +1843,4 @@ class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Cerrar Ticket", style=discord.ButtonStyle.danger, custom_id="repcl_btn_ticket_close", emoji="🔒")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        t = await q_one("SELECT * FROM tickets WHERE channel_id=? AND status='open'", (interaction.channel.id,))
-        if not t:
-            await interaction.response.send_message("ℹ️ Este ticket ya está cerrado.", ephemeral=True)
-            return
-        if interaction.user.id != t["user_id"] and not await is_repcl_admin(interaction.user):
-            await interaction.response.send_message("❌ Solo el autor o un administrador puede cerrar el ticket.", ephemeral=True)
-            return
-        await interaction.response.send_message("🔒 Cerrando ticket y guardando la transcripción…")
-        rows = await q_all("SELECT * FROM message_log WHERE channel_id=? ORDER BY message_id ASC", (interaction.channel.id,))
-        text = "\n".join(f"[{r['created_at']}] {r['author_tag']} ({r['author_id']}): {r['content']}"
-                         + (f"  [adjuntos: {r['attachments']}]" if r["attachments"] and r["attachments"] != "[]" else "") for r in rows) or "(sin mensajes)"
-        await q_exec("UPDATE tickets SET status='closed', closed_at=?, closed_by=? WHERE id=?", (now_iso(), str(interaction.user), t["id"]))
-        f = discord.File(io.BytesIO(text.encode("utf-8")), filename=f"ticket-{t['id']}.txt")
-        await audit(interaction.guild, "🎫 AUDITORÍA • TICKET CERRADO", "Ticket cerrado", color=ORANGE,
-                    user_id=t["user_id"], user_tag=t["user_tag"], channel=interaction.channel,
-                    fields=[("Cerrado por", f"{interaction.user.mention} (`{interaction.user.id}`)", True)], files=[f])
-        await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete(reason=f"Ticket cerrado por {interaction.user}")
-        except Exception as e:
-            print(f"[!] No se pudo borrar el canal del ticket: {e}")
-
-
-@slash("panel-tickets", "[ADMIN] Envía el panel para abrir tickets")
-async def cmd_panel_tickets(interaction: discord.Interaction):
-    if not await admin_guard(interaction):
-        return
-    embed = discord.Embed(title="🎫 SOPORTE • REPCL EJÉRCITO DE CHILE",
-                          description="¿Necesitas ayuda, quieres postular o hacer un reclamo? Pulsa el botón para abrir un ticket privado.",
-                          color=BLUE)
-    await interaction.channel.send(embed=embed, view=TicketPanelView())
-    await interaction.response.send_message("✅ Panel de tickets enviado.", ephemeral=True)
-    await log_admin(interaction, "Panel de tickets enviado")
-
-
-# ---------------------------------------------------------------------------
-# 16. EVENTO ON_READY, SALUD HTTP Y ARRANQUE
-# ---------------------------------------------------------------------------
-@bot.event
-async def on_ready():
-    print("=" * 60)
-    print(f"🇨🇱 REPCL • EJÉRCITO DE CHILE | conectado como {bot.user} (ID {bot.user.id})")
-    print(f"   Grupo Roblox: {await get_group_id()} · DB: {DB_PATH}")
-    if not ROBLOX_COOKIE:
-        print("   [!] ROBLOX_COOKIE vacío: /ascender y /descender no funcionarán.")
-    print("=" * 60)
-    await bot.change_presence(status=discord.Status.online,
-                              activity=discord.Activity(type=discord.ActivityType.watching, name="REPCL • Ejército de Chile 🇨🇱"))
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"REPCL bot: ONLINE")
-    def log_message(self, *args):
-        pass
-
-def start_health_server():
-    port = os.getenv("PORT")
-    if not port:
-        return
-    try:
-        server = HTTPServer(("0.0.0.0", int(port)), HealthHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        print(f"[+] Servidor de salud en el puerto {port}")
-    except Exception as e:
-        print(f"[!] No se pudo iniciar el servidor de salud: {e}")
-
-def main():
-    if not DISCORD_TOKEN or "tu_token" in DISCORD_TOKEN:
-        print("\n[!] ERROR: define DISCORD_TOKEN (o DISCORD_BOT_TOKEN) en las variables de entorno.\n")
-        sys.exit(1)
-    start_health_server()
-    bot.run(DISCORD_TOKEN)
-
-if __name__ == "__main__":
-    main()
+    @disco
